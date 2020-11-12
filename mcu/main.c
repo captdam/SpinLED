@@ -2,23 +2,23 @@
  *	PORT PIN TASK		PORT PIN TASK
  *	C6   1   Reset		C5   28  I2C
  *	D0   2   Rx		C4   27  I2C
- *	D1   3   Tx		C3   26  SPI-CS-SDCard
+ *	D1   3   Tx		C3   26  SPI-CS-MotionSensor
  *	D2   4			C2   25  Decoder-A2
  *	D3   5			C1   24  Decoder-A1
  *	D4   6			C0   23  Decoder-A0
  *	VCC  7			GND  22
  *	GND  8			AREF 21
- *	B6   9   Crystal	AVCC 20
- *	B7   10  Crystal	B5   19  SPI
+ *	B6   9			AVCC 20
+ *	B7   10			B5   19  SPI
  *	D5   11  OC0B-Blue	B4   18  SPI
  *	D6   12  OC0A-Green	B3   17  SPI
- *	D7   13  MotorD		B2   16  SPI-CS-MotionSensor
+ *	D7   13			B2   16  SPI-CS-SDCard
  *	B0   14			B1   15  OC1A-Red
  */
 
-#define CPU_FREQ 16000000
+#define CPU_FREQ 8000000
 
-#define SPEED 1 //1, 2, 3, 4 or 5, changing overall speed by modifying PWM clock prescaler (1, 8, 64, 256 or 1024)
+#define SPEED 2 //1, 2, 3, 4 or 5, changing overall speed by modifying PWM clock prescaler (1, 8, 64, 256 or 1024)
 
 #include <stdint.h>
 #include <avr/io.h>
@@ -26,15 +26,17 @@
 #include <avr/pgmspace.h>
 #include <avr/interrupt.h>
 
-volatile uint8_t x = 0;
-volatile uint8_t motionData[6];
+volatile uint8_t debug;
 
 volatile uint32_t frame = 0; //Which frame of the video is now display
-volatile uint8_t led = 0; //Which LED is now working
-volatile float phase = 0.0f;
+
+volatile uint8_t led = 0; //Which of the 8 LEDs is now working
+
+volatile float phase = 0.0f; //Current phase of the arm
+volatile float angularSpeed = 0.0f; //Phase speed
 
 volatile uint8_t imageBuffer[2][32][8][4]; //Image of current frame, double buffer, 32 phase, 8 radius, RGB (32-bit alignment), total = 1kB (2 SD card blocks)
-volatile uint8_t imageBufferIndex = 0; //LED rendering this one, fetching SD card content and writing to the other one
+volatile uint8_t imageBufferIndex = 0; //Double buffer: LED rendering this one, fetching SD card content and writing to the other one
 
 // MPU-6500/9250 on SPI bus
 void spiSelectMotionSensor() {
@@ -74,10 +76,10 @@ void spiMotionSensorRead(uint8_t baseAddr, uint8_t* buffer, uint8_t length) {
 
 // SDCard on SPI bus
 void spiSelectSDCard() {
-	PORTB &= 0b11111101;
+	PORTB &= 0b11111011;
 }
 void spiUnselectSDCard() {
-	PORTB |= 0b00000010;
+	PORTB |= 0b00000100;
 }
 
 // MCU main
@@ -88,44 +90,60 @@ int main() {
 	DDRC = 0xFF;
 	DDRD = 0xFF;
 
-	//Init SPI - 1MHZ master
+	//Init SPI - master
 	spiUnselectMotionSensor();
 	spiUnselectSDCard();
-	SPCR = (1<<SPE) | (1<<MSTR) | (1<<SPR0); //Enable SPI as master, no interrupt, MSB first, SCK low on idle, f_SPI = CPU_FREQ / 16 = 1MHz @ 16MHz CPU
-	spiSelectMotionSensor();
+	SPCR = (1<<SPE) | (1<<MSTR) | (1<<SPR0); //Enable SPI as master, no interrupt, MSB first, SCK low on idle, f_SPI = CPU_FREQ / 16 = 0.5MHz @ 8MHz CPU
+	spiMotionSensorReset();
 
-	//Setup timer 0 - Blue and green PWM signal
+	//Get gyroscope bias
+	uint8_t gyroBias[2];
+	spiMotionSensorRead(0x47, gyroBias, sizeof(gyroBias)); //Z-axis angular speed (2-byte)
+	uint16_t bias = (gyroBias[0] << 8) | gyroBias[1]; //avr-gcc is little endian (LSB on lower address)
+
+	//Setup timer 0 and 1 - RGB PWM signal
 	TCCR0A = (2<<COM0A0) | (2<<COM0B0) | (3<<WGM00); //Fast PWM (update OCR at top), set at zero, clear on compare match
-	TCCR0B = (SPEED<<CS00); //Using system clock
-	TIMSK0 = (1<<TOIE0); //ISR when overflow: Setup PWM for both timer 0 and 1 (process next pixel)
-
-	//Setup timer 1 - Red PWM signal
 	TCCR1A = (2<<COM1A0) | (1<<WGM10); //Fast PWM (8-bit, update OCR at zero), set at zero, clear on compare match
-	TCCR1B = (1<<WGM12) | (SPEED<<CS10); //Using system clock
-
+	TIMSK0 = (1<<TOIE0); //ISR when overflow: Setup PWM for both timer (process next pixel)
+	TCCR0B = (SPEED<<CS00); //Turn on timer
+	TCCR1B = (1<<WGM12) | (SPEED<<CS10);
 	/* T1 will be slightly lag after T0 because T1 is enabled after T0, but this difference will not cause any big issue */
+	/* Refresh rate = 256us if scaler = 8, CPU frequency = 8MHz */
 
 	//Setup timer 2 - Go to next frame
-	TCCR2B = (7<<CS20); //Prescaller = 1024, speed = 64us, overflow (256) = 61Hz, @16MHz CPU
+	TCCR2B = (7<<CS20); //Prescaller = 1024, speed = 128us, overflow (256) = 30.5Hz, @8MHz CPU
 	TIMSK2 = (1<<TOIE2); //Enable overflow interrupt
 
-	//Setup image buffer pointer
+	//Load default image
+	for (uint8_t p = 0; p < 32; p++) {
+		for (uint8_t r = 0; r < 8; r++) {
+			imageBuffer[0][p][r][0] = imageBuffer[1][p][r][0] = 1 << r; //R
+			imageBuffer[0][p][r][1] = imageBuffer[1][p][r][1] = 0xFF >> r; //G
+			imageBuffer[0][p][r][2] = imageBuffer[1][p][r][2] = 120; //B
+		}
+	}
+	for (uint16_t i = 0; i < 65000; i++);
 
-	//Idel - ISR takes control
+	//Main process loop
 	sei();
-//	set_sleep_mode(0);
-//	sleep_mode();
 	for (;;) {
-//		sleep_mode();
-		uint8_t mData[6];
-		spiMotionSensorRead(0x3B, mData, sizeof(mData)); //ACCEL
-		for (uint8_t i = 0; i < sizeof(mData); i++)
-			motionData[i] = mData[i];
+		uint8_t rawAngularSpeed[2];
+		spiMotionSensorRead(0x47, rawAngularSpeed, sizeof(rawAngularSpeed)); //Z-axis angular speed (0x47H, 0x48L)
+		debug = rawAngularSpeed[0];
+		/* Range: +/- 250dps -->  */
+		uint16_t raw = (rawAngularSpeed[0] << 8) | rawAngularSpeed[1];
+		int16_t aSpeed = raw - bias; //Remove bias and offset
+		float nomalizedSpeed = aSpeed / 32768.0f; //Range = [-1.0f:1.0f] = [-250dps:+250dps]
+		float speedPrePeriod = nomalizedSpeed * 250.0f * 0.000256f; //Measure range = 250dps, calculate frequnecy = every 256us
+		cli(); //Do not interrupt when convert and write the measured data to angular speed
+		angularSpeed = speedPrePeriod;
+		sei();
 	}
 }
 
 // Write RGB signal to LED control
-ISR (TIMER0_OVF_vect) {
+ISR (TIMER0_OVF_vect) { //Takes about 360 cycles
+	/* Turn on LEDn (n=1~7), setup RGB PWM signal for LED(n+1 mod 8) */
 
 	/* Note of timer OCR update:
 	 * Timer 0 updates OCR at top but timer 1 does this at zero
@@ -138,29 +156,38 @@ ISR (TIMER0_OVF_vect) {
 	 */
 
 	//Go to next LED, only the least 3 significant bits are used (8 LEDs)
-	led = (led + 1) & 0b111;
 	PORTC = led; //To 74LS138, one cold signal
-	
-/*	//The wing's position is between 2 pixel, we mix the color of these 2 pixels
-	float currentPhase = phase;
-	uint8_t lIdx = (uint8_t)currentPhase; //If at phase 20.8: lIdx = 20, weight 0.2; rIdx = 21, weight 0.8
-	uint8_t rIdx = lIdx + 1;
-	float lWeight = rIdx - currentPhase;
-	float rWeight = currentPhase - lIdx; //NOTE: TOOOOOOOOO COMPLEX, TIME NOT ENOUGH!!!!!
+	led = (led + 1) & 0b111;
 
-	// NOTE: Do we REALLY need to use the weight average of two pixel? The average seems cannot give any advantage at all
+	//Estemate current phase based on angular speed
+	phase += angularSpeed;
+//	while (phase > 360.1f) //Normalize phase, keep the number small to prevent overflow (think this may run for 99999 years)
+//		phase -= 360.0f;
+//	while (phase < 0.0f)
+//		phase += 360.0f;
 
-	//Apply RGB to PWM generator (LED)
-	OCR1A = image[lIdx][led][0] * lWeight + image[rIdx][led][0] * rWeight; //R
-	OCR0A = image[lIdx][led][1] * lWeight + image[rIdx][led][1] * rWeight; //G
-	OCR0B = image[lIdx][led][2] * lWeight + image[rIdx][led][2] * rWeight; //B
-*/
-	OCR1A = 128-abs(motionData[0]-128); //ACCEL_X_H
-	OCR0A = 128-abs(motionData[2]-128); //ACCEL_Y_H
-	OCR0B = 128-abs(motionData[4]-128); //ACCEL_Z_H
+	uint8_t currentPhase = (uint8_t)(phase / 360.0f * 32.0f);
+	currentPhase %= 32;
+//	OCR1A = imageBuffer[imageBufferIndex][currentPhase][led][0];
+//	OCR0A = imageBuffer[imageBufferIndex][currentPhase][led][1];
+//	OCR0B = imageBuffer[imageBufferIndex][currentPhase][led][2];
+
+	OCR0A = currentPhase * 8; //Green = current phase
+	if (debug & 0x80) { //Red = angular speed if nagative direction
+		OCR1A = 0 - debug;
+		OCR0B = 0;
+	}
+	else { //Blue = angular speed if positive direction
+		OCR1A = 0;
+		OCR0B = debug;
+	}
 }
 
 // Advance to next video frame
 ISR (TIMER2_OVF_vect) {
+	imageBufferIndex = (imageBufferIndex + 1) & 1;
 	frame++;
+	sei(); //Allow TIMER0_OVF_vect
+
+
 }
